@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "langfuse": {
+      "type": "remote",
+      "url": "https://us.cloud.langfuse.com/api/public/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Basic cGstbGYtWU9VUl9MQU5HRlVTRV9QVUJMSUNfS0VZOnNrLWxmLVlPVVJfTEFOR0ZVU0VfU0VDUkVUX0tFWQ=="
+      }
+    }
+  }
+}
