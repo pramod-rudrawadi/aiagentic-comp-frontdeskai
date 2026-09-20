@@ -117,7 +117,7 @@ class TestSupervisorRouting:
             importlib.reload(agents)
 
         mock_chain = MagicMock()
-        mock_chain.invoke.return_value = mock_classification(category, 9)
+        mock_chain.with_config.return_value.invoke.return_value = mock_classification(category, 9)
 
         with patch.object(agents, "get_llm_chain", return_value=mock_chain):
             state = {
@@ -154,7 +154,7 @@ class TestSupervisorRouting:
             importlib.reload(agents)
 
         mock_chain = MagicMock()
-        mock_chain.invoke.return_value = mock_classification("general", confidence=3)
+        mock_chain.with_config.return_value.invoke.return_value = mock_classification("general", confidence=3)
 
         with patch.object(agents, "get_llm_chain", return_value=mock_chain):
             state = {
@@ -181,7 +181,7 @@ class TestSupervisorRouting:
             importlib.reload(agents)
 
         mock_chain = MagicMock()
-        mock_chain.invoke.side_effect = Exception("LLM unavailable")
+        mock_chain.with_config.return_value.invoke.side_effect = Exception("LLM unavailable")
 
         with patch.object(agents, "get_llm_chain", return_value=mock_chain):
             state = {
