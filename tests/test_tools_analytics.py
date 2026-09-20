@@ -8,6 +8,17 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 
+def _as(employee_id):
+    """Act as this employee, the way the web app does — via the session ContextVar."""
+    from auth import current_user_email
+    return current_user_email.set(f"{employee_id}@test.com")
+
+
+def _reset(token):
+    from auth import current_user_email
+    current_user_email.reset(token)
+
+
 @pytest.fixture(autouse=True)
 def setup_db(env):
     from tools import _get_db
@@ -88,12 +99,15 @@ class TestExpenseSummary:
 
     def test_reflects_submitted_claims(self, env):
         from tools import submit_expense_claim, get_expense_summary
-        submit_expense_claim.invoke({
-            "employee_id": "EMP001",
-            "amount": 500.0,
-            "category": "travel",
-            "description": "Analytics expense",
-        })
+        token = _as("EMP001")
+        try:
+            submit_expense_claim.invoke({
+                "amount": 500.0,
+                "category": "travel",
+                "description": "Analytics expense",
+            })
+        finally:
+            _reset(token)
         result = get_expense_summary.invoke({})
         assert "500" in result or "pending" in result.lower() or "1" in result
 

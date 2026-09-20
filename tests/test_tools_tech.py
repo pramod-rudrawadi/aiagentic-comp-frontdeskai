@@ -8,6 +8,17 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 
+def _as(employee_id):
+    """Act as this employee, the way the web app does — via the session ContextVar."""
+    from auth import current_user_email
+    return current_user_email.set(f"{employee_id}@test.com")
+
+
+def _reset(token):
+    from auth import current_user_email
+    current_user_email.reset(token)
+
+
 @pytest.fixture(autouse=True)
 def setup_db(env):
     from tools import _get_db
@@ -108,15 +119,23 @@ class TestGetTicketStatus:
 class TestListMyTickets:
     def test_list_tickets_for_employee_with_tickets(self, env):
         from tools import create_ticket, list_my_tickets
-        create_ticket.invoke({
-            "summary": "My ticket",
-            "priority": "P3",
-            "created_by": "EMP001",
-        })
-        result = list_my_tickets.invoke({"employee_id": "EMP001"})
+        token = _as("EMP001")
+        try:
+            create_ticket.invoke({
+                "summary": "My ticket",
+                "priority": "P3",
+                "created_by": "EMP001",
+            })
+            result = list_my_tickets.invoke({})
+        finally:
+            _reset(token)
         assert "My ticket" in result or "TECH-" in result
 
     def test_list_tickets_for_employee_with_no_tickets(self, env):
         from tools import list_my_tickets
-        result = list_my_tickets.invoke({"employee_id": "EMP999"})
+        token = _as("EMP002")
+        try:
+            result = list_my_tickets.invoke({})
+        finally:
+            _reset(token)
         assert "no ticket" in result.lower() or "not found" in result.lower() or result.strip() != ""

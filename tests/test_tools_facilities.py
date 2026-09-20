@@ -1,4 +1,8 @@
-"""Tests for Facilities domain tools: check_room_availability, book_meeting_room."""
+"""Tests for Facilities domain tools: check_room_availability, book_meeting_room.
+
+book_meeting_room takes the booker from the current_user_email ContextVar,
+so tests act as an employee via ``_as()`` before booking.
+"""
 
 import os
 import sys
@@ -8,6 +12,17 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 TEST_DATE = "2026-12-15"   # future date unlikely to have conflicts
+
+
+def _as(employee_id):
+    """Act as this employee, the way the web app does — via the session ContextVar."""
+    from auth import current_user_email
+    return current_user_email.set(f"{employee_id}@test.com")
+
+
+def _reset(token):
+    from auth import current_user_email
+    current_user_email.reset(token)
 
 
 @pytest.fixture(autouse=True)
@@ -50,21 +65,23 @@ class TestCheckRoomAvailability:
 
     def test_no_rooms_available_returns_message(self, env):
         from tools import book_meeting_room, check_room_availability
-        # Book both rooms for the same slot
-        book_meeting_room.invoke({
-            "room_name": "Conference Room A",
-            "date": "2026-11-01",
-            "start_time": "10:00",
-            "end_time": "11:00",
-            "booked_by": "EMP001",
-        })
-        book_meeting_room.invoke({
-            "room_name": "Board Room",
-            "date": "2026-11-01",
-            "start_time": "10:00",
-            "end_time": "11:00",
-            "booked_by": "EMP001",
-        })
+        token = _as("EMP001")
+        try:
+            # Book both rooms for the same slot
+            book_meeting_room.invoke({
+                "room_name": "Conference Room A",
+                "date": "2026-11-01",
+                "start_time": "10:00",
+                "end_time": "11:00",
+            })
+            book_meeting_room.invoke({
+                "room_name": "Board Room",
+                "date": "2026-11-01",
+                "start_time": "10:00",
+                "end_time": "11:00",
+            })
+        finally:
+            _reset(token)
         result = check_room_availability.invoke({
             "date": "2026-11-01",
             "start_time": "10:00",
@@ -85,15 +102,18 @@ class TestCheckRoomAvailability:
 class TestBookMeetingRoom:
     def test_book_available_room(self, env):
         from tools import book_meeting_room
-        result = book_meeting_room.invoke({
-            "room_name": "Conference Room A",
-            "date": TEST_DATE,
-            "start_time": "09:00",
-            "end_time": "10:00",
-            "booked_by": "EMP001",
-            "purpose": "Sprint Planning",
-            "attendees": 5,
-        })
+        token = _as("EMP001")
+        try:
+            result = book_meeting_room.invoke({
+                "room_name": "Conference Room A",
+                "date": TEST_DATE,
+                "start_time": "09:00",
+                "end_time": "10:00",
+                "purpose": "Sprint Planning",
+                "attendees": 5,
+            })
+        finally:
+            _reset(token)
         assert "confirmed" in result.lower() or "booked" in result.lower() or "success" in result.lower()
 
     def test_double_booking_rejected(self, env):
@@ -103,34 +123,43 @@ class TestBookMeetingRoom:
             "date": "2026-12-20",
             "start_time": "10:00",
             "end_time": "11:00",
-            "booked_by": "EMP001",
         }
-        book_meeting_room.invoke(kwargs)
-        result2 = book_meeting_room.invoke(kwargs)
+        token = _as("EMP001")
+        try:
+            book_meeting_room.invoke(kwargs)
+            result2 = book_meeting_room.invoke(kwargs)
+        finally:
+            _reset(token)
         assert "unavailable" in result2.lower() or "already booked" in result2.lower() or "conflict" in result2.lower()
 
     def test_book_nonexistent_room(self, env):
         from tools import book_meeting_room
-        result = book_meeting_room.invoke({
-            "room_name": "Imaginary Room",
-            "date": TEST_DATE,
-            "start_time": "10:00",
-            "end_time": "11:00",
-            "booked_by": "EMP001",
-        })
+        token = _as("EMP001")
+        try:
+            result = book_meeting_room.invoke({
+                "room_name": "Imaginary Room",
+                "date": TEST_DATE,
+                "start_time": "10:00",
+                "end_time": "11:00",
+            })
+        finally:
+            _reset(token)
         assert "not found" in result.lower() or "imaginary" in result.lower()
 
     def test_booking_stored_in_db(self, env):
         import tools as t
         from tools import book_meeting_room
-        book_meeting_room.invoke({
-            "room_name": "Board Room",
-            "date": TEST_DATE,
-            "start_time": "11:00",
-            "end_time": "12:00",
-            "booked_by": "EMP001",
-            "purpose": "All Hands",
-        })
+        token = _as("EMP001")
+        try:
+            book_meeting_room.invoke({
+                "room_name": "Board Room",
+                "date": TEST_DATE,
+                "start_time": "11:00",
+                "end_time": "12:00",
+                "purpose": "All Hands",
+            })
+        finally:
+            _reset(token)
         db = sqlite3.connect(t.TOOLS_DB)
         row = db.execute(
             "SELECT * FROM room_bookings WHERE purpose='All Hands'"
