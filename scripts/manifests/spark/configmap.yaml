@@ -1,0 +1,45 @@
+# Non-secret app configuration for a participant namespace on the Spark cluster.
+# The credential half lives in two Secrets (see deployment.yaml envFrom):
+#   agenticaiu<N>-llm  — LiteLLM gateway key + base URL, injected by the lab platform
+#   frontdeskai-secret — SECRET_KEY / AUTH_PASSWORD, created by deploy-spark.sh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontdeskai-config
+  labels:
+    app: frontdeskai
+data:
+  # LiteLLM is an OpenAI-compatible gateway; agents.py reads the base URL and
+  # key from LITELLM_*/OPENAI_* in the platform Secret.
+  LLM_PROVIDER: "litellm"
+  LLM_MODEL: "qwen36-35b-a3b-lab"
+  # No second vendor to fall back to here. An empty model disables the fallback
+  # rather than leaving it pointed at Groq, which has no key in this namespace.
+  LLM_FALLBACK_PROVIDER: ""
+  LLM_FALLBACK_MODEL: ""
+
+  # Pre-populate demo employees, leave, tickets, expenses, rooms, payslips.
+  SEED_DEMO_DATA: "true"
+
+  # Observability. Prometheus metrics are served on /metrics either way; spans go
+  # to Tempo in the `monitoring` namespace over OTLP/gRPC.
+  #
+  # ⚠️ The service name carries the namespace, so 31 participants sharing one
+  # Tempo can each find their own traces in the service dropdown. deploy-spark.sh
+  # substitutes it; SERVICE_NAME_PLACEHOLDER is what it looks for.
+  #
+  # ⚠️ An empty OTEL_EXPORTER_OTLP_ENDPOINT disables the exporter entirely. Set it
+  # empty rather than wrong: BatchSpanProcessor swallows export failures, so a
+  # bad endpoint drops every span while the app looks perfectly healthy.
+  OTEL_SERVICE_NAME: "SERVICE_NAME_PLACEHOLDER"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://tempo.monitoring.svc.cluster.local:4317"
+  LOG_LEVEL: "INFO"
+
+  # HOME is deliberately NOT set here. The image points it at /opt/appcache,
+  # where the ChromaDB ONNX embedding model is baked in; overriding it sends
+  # chromadb looking for a model it would then try to download, and this
+  # namespace has no internet egress.
+  SQLITE_DIR: "/shared/.sqlite"
+
+  # Fails closed if SECRET_KEY is missing rather than minting a throwaway one.
+  ENV: "production"

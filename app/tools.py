@@ -236,13 +236,16 @@ CREATE TABLE IF NOT EXISTS employees (
         );
     """)
     # Seed defaults (idempotent)
+    # Seeded from the environment so a deployment picks the provider without a
+    # code change; unset env keeps the historical Ollama -> Groq pairing. These
+    # rows win over agents.py's module defaults, so both must read the same env.
     config_defaults = [
-        ("llm_provider",    "ollama"),
-        ("llm_model",       "gemma3:12b"),
+        ("llm_provider",    os.getenv("LLM_PROVIDER", "ollama")),
+        ("llm_model",       os.getenv("LLM_MODEL", "gemma3:12b")),
         ("llm_temperature", "0"),
         ("llm_api_key",     ""),
-        ("llm_fallback_provider",    "groq"),
-        ("llm_fallback_model",       "llama-3.3-70b-versatile"),
+        ("llm_fallback_provider",    os.getenv("LLM_FALLBACK_PROVIDER", "groq")),
+        ("llm_fallback_model",       os.getenv("LLM_FALLBACK_MODEL", "llama-3.3-70b-versatile")),
         ("llm_fallback_temperature", "0"),
         ("llm_fallback_api_key",     ""),
         ("smtp_host",       ""),
@@ -452,6 +455,10 @@ def _next_claim_id(conn: sqlite3.Connection) -> str:
 
 # ========== HR TOOLS ==========
 
+# Explicit mapping — never construct column names from input
+_LEAVE_COLUMNS = {"casual": "casual_leave", "sick": "sick_leave", "earned": "earned_leave", "wfh": "wfh_days"}
+
+
 def _get_current_employee_id() -> str:
     """Get the current user's employee_id from the context variable."""
     from auth import current_user_email
@@ -526,8 +533,6 @@ def apply_leave(leave_type: str, start_date: str, end_date: str, reason: str = "
         if not row:
             return f"Employee '{employee_id}' not found in the system."
 
-        # Explicit mapping — never construct column names from input
-        _LEAVE_COLUMNS = {"casual": "casual_leave", "sick": "sick_leave", "earned": "earned_leave", "wfh": "wfh_days"}
         col = _LEAVE_COLUMNS[leave_type]  # safe: leave_type already validated above
         available = row[col]
         if days > available:
@@ -551,11 +556,12 @@ def apply_leave(leave_type: str, start_date: str, end_date: str, reason: str = "
         auto_approve = days <= 3
         status = "approved" if auto_approve else "pending"
 
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO leave_requests (employee_id, leave_type, start_date, end_date, days, reason, status) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (employee_id, leave_type, start_date, end_date, days, reason, status),
         )
+        request_id = cur.lastrowid
 
         if auto_approve:
             conn.execute(
@@ -565,18 +571,167 @@ def apply_leave(leave_type: str, start_date: str, end_date: str, reason: str = "
             )
             remaining = available - days
             result = (
-                f"Leave approved! {days} day(s) of {leave_type} leave from {start_date} to {end_date}.\n"
+                f"Leave approved! Request #{request_id}: {days} day(s) of {leave_type} leave "
+                f"from {start_date} to {end_date}.\n"
                 f"Remaining {leave_type}: {remaining} days."
             )
         else:
             result = (
-                f"Leave request submitted for manager approval: {days} day(s) of {leave_type} leave "
-                f"from {start_date} to {end_date}.\n"
-                f"Requests of more than 3 days require manager approval. You'll be notified once reviewed."
+                f"Leave request #{request_id} submitted for manager approval: {days} day(s) of "
+                f"{leave_type} leave from {start_date} to {end_date}.\n"
+                f"Requests of more than 3 days require manager approval. Quote request "
+                f"#{request_id} when you ask about it."
             )
 
         conn.commit()
         return result
+    finally:
+        conn.close()
+
+
+@tool
+def list_pending_leave_requests() -> str:
+    """List leave requests from your direct reports that are waiting for your decision.
+
+    Takes no arguments — the team is resolved from the employees table using the
+    caller's session identity, so a manager only ever sees their own reports.
+    """
+    manager_id = _get_current_employee_id()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT lr.id, lr.leave_type, lr.start_date, lr.end_date, lr.days, lr.reason, "
+            "lr.created_at, e.full_name, e.employee_id "
+            "FROM leave_requests lr "
+            "JOIN employees e ON lr.employee_id = e.employee_id "
+            "WHERE e.manager_id = ? AND lr.status = 'pending' "
+            "ORDER BY lr.created_at",
+            (manager_id,),
+        ).fetchall()
+        if not rows:
+            return "No leave requests from your team are waiting for your decision."
+
+        lines = [f"Leave requests awaiting your decision ({len(rows)}):"]
+        for r in rows:
+            lines.append(
+                f"  Request #{r['id']} — {r['full_name']} ({r['employee_id']}): "
+                f"{r['days']} day(s) {r['leave_type']} leave, {r['start_date']} to {r['end_date']}"
+            )
+            lines.append(
+                f"      Reason: {r['reason'] or '(none given)'}    Submitted: {r['created_at']}"
+            )
+        lines.append("Approve or reject one by its request number.")
+        return "\n".join(lines)
+    finally:
+        conn.close()
+
+
+@tool
+def approve_leave_request(request_id: int, status: str) -> str:
+    """Approve or reject a pending leave request from your team. status: 'approved' or 'rejected'.
+
+    The approver is always the logged-in employee — it cannot be supplied as an
+    argument. Only the requester's own manager may decide their leave, and nobody
+    may decide their own. Approving deducts the days from the requester's balance.
+    """
+    if status not in ("approved", "rejected"):
+        return "Status must be 'approved' or 'rejected'."
+
+    approver_id = _get_current_employee_id()
+
+    conn = _get_db()
+    try:
+        row = conn.execute(
+            "SELECT lr.id, lr.employee_id, lr.leave_type, lr.start_date, lr.end_date, lr.days, "
+            "lr.status, e.full_name, e.manager_id "
+            "FROM leave_requests lr "
+            "JOIN employees e ON lr.employee_id = e.employee_id "
+            "WHERE lr.id = ?",
+            (request_id,),
+        ).fetchone()
+        if not row:
+            return f"Leave request #{request_id} not found."
+        if row["status"] != "pending":
+            return f"Leave request #{request_id} is already {row['status']} — cannot change status."
+        if row["employee_id"] == approver_id:
+            return "You cannot approve or reject your own leave request."
+        if row["manager_id"] != approver_id:
+            return (
+                f"You are not authorised to decide this request. Only {row['full_name']}'s "
+                "own manager can approve or reject it."
+            )
+
+        if status == "approved":
+            col = _LEAVE_COLUMNS[row["leave_type"]]  # safe: constrained by the table's CHECK
+            balance = conn.execute(
+                "SELECT * FROM leave_balances WHERE employee_id = ?", (row["employee_id"],)
+            ).fetchone()
+            # Re-check at decision time: the balance may have moved since the request was filed.
+            available = balance[col] if balance else 0
+            if row["days"] > available:
+                return (
+                    f"Cannot approve request #{request_id}: {row['full_name']} has only "
+                    f"{available} day(s) of {row['leave_type']} leave left but the request is for "
+                    f"{row['days']}. Ask them to amend or cancel it."
+                )
+            conn.execute(
+                f"UPDATE leave_balances SET {col} = {col} - ?, updated_at = datetime('now') "
+                "WHERE employee_id = ?",
+                (row["days"], row["employee_id"]),
+            )
+
+        conn.execute(
+            "UPDATE leave_requests SET status = ?, approved_by = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (status, approver_id, request_id),
+        )
+        conn.commit()
+
+        if status == "rejected":
+            return (
+                f"Leave request #{request_id} ({row['full_name']}, {row['days']} day(s) "
+                f"{row['leave_type']} leave from {row['start_date']}) has been rejected by {approver_id}."
+            )
+        remaining = available - row["days"]
+        return (
+            f"Leave request #{request_id} approved by {approver_id}: {row['full_name']} — "
+            f"{row['days']} day(s) {row['leave_type']} leave from {row['start_date']} to "
+            f"{row['end_date']}.\nTheir remaining {row['leave_type']} balance is {remaining} days."
+        )
+    finally:
+        conn.close()
+
+
+@tool
+def list_my_leave_requests() -> str:
+    """List the current employee's own leave requests with their status and who decided them."""
+    employee_id = _get_current_employee_id()
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT lr.id, lr.leave_type, lr.start_date, lr.end_date, lr.days, lr.status, "
+            "lr.updated_at, a.full_name AS approver_name "
+            "FROM leave_requests lr "
+            "LEFT JOIN employees a ON lr.approved_by = a.employee_id "
+            "WHERE lr.employee_id = ? "
+            "ORDER BY lr.id DESC",
+            (employee_id,),
+        ).fetchall()
+        if not rows:
+            return f"No leave requests found for '{employee_id}'."
+
+        lines = [f"Leave requests for {employee_id} ({len(rows)} total):"]
+        for r in rows:
+            line = (
+                f"  Request #{r['id']}: {r['days']} day(s) {r['leave_type']} leave, "
+                f"{r['start_date']} to {r['end_date']} — {r['status']}"
+            )
+            if r["status"] == "pending":
+                line += " (waiting for your manager)"
+            elif r["approver_name"]:
+                line += f" by {r['approver_name']} on {r['updated_at']}"
+            lines.append(line)
+        return "\n".join(lines)
     finally:
         conn.close()
 
@@ -1238,6 +1393,68 @@ def _is_valid_openrouter_model(name: str) -> bool:
     return "/" in name and len(name) > 3
 
 
+def _llm_config_error(provider: str, model_name: str, api_key: str) -> str:
+    """Return an error string if this provider/model/key cannot be used, else ''.
+
+    Checks the key FIRST so the admin gets a sentence they can act on, then
+    actually constructs the client, because a config that cannot be built is
+    the one failure the app cannot recover from on its own: a broken PRIMARY
+    kills the supervisor, which is the only route back to this tool. Verify
+    before persisting, never after.
+    """
+    env_key = {
+        "groq": "GROQ_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "ollama": "OLLAMA_API_KEY",
+    }.get(provider)
+    if env_key and not api_key and not os.getenv(env_key):
+        return (
+            f"{provider} requires an API key. Pass one via the api_key parameter or set "
+            f"{env_key} in the environment. (This deployment reaches its model through the "
+            f"'litellm' provider, which needs no key of its own.)"
+        )
+    try:
+        from agents import _build_llm
+        llm = _build_llm({"provider": provider, "model": model_name,
+                          "temperature": 0.0, "api_key": api_key})
+    except Exception as e:
+        return f"Cannot use {provider}/{model_name}: {type(e).__name__}: {e}. Configuration unchanged."
+
+    probe = _llm_probe_error(llm)
+    if probe:
+        return (
+            f"{provider}/{model_name} could be built but did not answer a test call: {probe}\n"
+            f"Configuration unchanged. Check the model name is one the provider actually serves "
+            f"(get_llm_config shows the one in use), and the API key if you supplied one. "
+            f"If the provider is only briefly unavailable, try again."
+        )
+    return ""
+
+
+def _llm_probe_error(llm, timeout: float = 20.0) -> str:
+    """Send the cheapest possible call. Returns '' if the model answered.
+
+    Construction is not proof of a working config: ChatOpenAI accepts ANY model
+    string and only fails on the first real call, so a name the gateway does not
+    serve was saved happily and bricked the app at the next request. One live
+    call is the only check that distinguishes a usable config from a plausible
+    one. It runs in a thread with a wall-clock timeout because the OpenAI client
+    defaults to 600s, and a config tool that hangs the agent for ten minutes is
+    its own outage.
+    """
+    import concurrent.futures
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        ex.submit(llm.invoke, "ping").result(timeout=timeout)
+        return ""
+    except concurrent.futures.TimeoutError:
+        return f"no response within {timeout:.0f}s"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _get_system_config(key: str) -> str:
     """Read a single value from system_config table."""
     conn = _get_db()
@@ -1334,11 +1551,14 @@ def get_llm_config() -> str:
 
 
 @tool
-def change_llm_model(model_name: str, provider: str = "groq", temperature: float = 0.0, api_key: str = "") -> str:
-    """Change the LLM model used by all agents. provider: 'groq', 'openrouter', or 'ollama'.
-    model_name: e.g. 'llama-3.1-8b-instant' (groq), 'google/gemini-2.0-flash-001' (openrouter), or 'llama3.3:70b' (ollama).
-    api_key: optional — omit to keep using the environment variable (GROQ_API_KEY / OLLAMA_API_KEY).
-    For openrouter and ollama, an API key is required (set via this tool or the respective env var)."""
+def change_llm_model(model_name: str, provider: str = "litellm", temperature: float = 0.0, api_key: str = "") -> str:
+    """Change the LLM model used by all agents. provider: 'litellm' (default), 'groq', 'openrouter', or 'ollama'.
+    Prefer 'litellm' — it is the gateway this deployment is configured for and needs no API key.
+    model_name: e.g. 'qwen36-35b-a3b-lab' (litellm), 'llama-3.1-8b-instant' (groq),
+    'google/gemini-2.0-flash-001' (openrouter), or 'llama3.3:70b' (ollama).
+    api_key: optional — omit to keep using the environment variable.
+    groq, openrouter and ollama each require an API key, via this tool or their env var
+    (GROQ_API_KEY / OPENROUTER_API_KEY / OLLAMA_API_KEY); a config that cannot be built is rejected."""
     from auth import current_user_email
     try:
         email = current_user_email.get()
@@ -1346,8 +1566,8 @@ def change_llm_model(model_name: str, provider: str = "groq", temperature: float
         email = "unknown"
 
     provider = provider.lower().strip()
-    if provider not in ("groq", "openrouter", "ollama"):
-        return f"Invalid provider '{provider}'. Must be 'groq', 'openrouter', or 'ollama'."
+    if provider not in ("groq", "openrouter", "ollama", "litellm"):
+        return f"Invalid provider '{provider}'. Must be 'groq', 'openrouter', 'ollama', or 'litellm'."
 
     if provider == "groq" and model_name not in GROQ_MODELS:
         valid = ", ".join(sorted(GROQ_MODELS))
@@ -1360,11 +1580,9 @@ def change_llm_model(model_name: str, provider: str = "groq", temperature: float
         )
 
     # For openrouter, an API key is required (either passed or from env)
-    if provider == "openrouter" and not api_key and not os.getenv("OPENROUTER_API_KEY"):
-        return "OpenRouter requires an API key. Pass one via api_key parameter or set OPENROUTER_API_KEY env var."
-
-    if provider == "ollama" and not api_key and not os.getenv("OLLAMA_API_KEY"):
-        return "Ollama Cloud requires an API key. Pass one via api_key parameter or set OLLAMA_API_KEY env var."
+    err = _llm_config_error(provider, model_name, api_key)
+    if err:
+        return err
 
     _set_system_config("llm_provider", provider, email)
     _set_system_config("llm_model", model_name, email)
@@ -1387,10 +1605,14 @@ def change_llm_model(model_name: str, provider: str = "groq", temperature: float
 
 
 @tool
-def configure_fallback_llm(model_name: str, provider: str = "ollama", api_key: str = "") -> str:
+def configure_fallback_llm(model_name: str, provider: str = "litellm", api_key: str = "") -> str:
     """Configure a fallback LLM used automatically when the primary hits rate limits or errors.
-    model_name: e.g. 'llama3.3:70b' (ollama), 'llama-3.1-8b-instant' (groq), or 'google/gemini-flash-1.5' (openrouter).
-    provider: 'ollama', 'groq', or 'openrouter'. api_key: optional, leave empty to use env var (OLLAMA_API_KEY).
+    provider: 'litellm' (default), 'groq', 'openrouter', or 'ollama'. Prefer 'litellm' — it is the
+    gateway this deployment is configured for and needs no API key.
+    model_name: e.g. 'qwen36-35b-a3b-lab' (litellm), 'llama-3.1-8b-instant' (groq),
+    'llama3.3:70b' (ollama), or 'google/gemini-flash-1.5' (openrouter).
+    api_key: optional, leave empty to use the provider's env var. A fallback that cannot be
+    built is rejected rather than saved.
     To disable the fallback, call with model_name='none'."""
     from auth import current_user_email
     try:
@@ -1407,8 +1629,8 @@ def configure_fallback_llm(model_name: str, provider: str = "ollama", api_key: s
         return "Fallback LLM disabled."
 
     provider = provider.lower().strip()
-    if provider not in ("groq", "openrouter", "ollama"):
-        return f"Invalid provider '{provider}'. Must be 'groq', 'openrouter', or 'ollama'."
+    if provider not in ("groq", "openrouter", "ollama", "litellm"):
+        return f"Invalid provider '{provider}'. Must be 'groq', 'openrouter', 'ollama', or 'litellm'."
 
     if provider == "groq" and model_name not in GROQ_MODELS:
         valid = ", ".join(sorted(GROQ_MODELS))
@@ -1420,11 +1642,9 @@ def configure_fallback_llm(model_name: str, provider: str = "ollama", api_key: s
             "Use 'provider/model' format (e.g. 'google/gemini-flash-1.5', 'anthropic/claude-3.5-haiku')."
         )
 
-    if provider == "openrouter" and not api_key and not os.getenv("OPENROUTER_API_KEY"):
-        return "OpenRouter requires an API key. Pass one via api_key parameter or set OPENROUTER_API_KEY env var."
-
-    if provider == "ollama" and not api_key and not os.getenv("OLLAMA_API_KEY"):
-        return "Ollama Cloud requires an API key. Pass one via api_key parameter or set OLLAMA_API_KEY env var."
+    err = _llm_config_error(provider, model_name, api_key)
+    if err:
+        return err
 
     _set_system_config("llm_fallback_provider", provider, email)
     _set_system_config("llm_fallback_model", model_name, email)
@@ -1791,7 +2011,11 @@ def approve_leave_via_mcp(
         )
 
 
-HR_TOOLS = [get_leave_balance_from_hr_system, approve_leave_via_mcp, get_leave_balance, apply_leave]
+HR_TOOLS = [
+    get_leave_balance_from_hr_system, approve_leave_via_mcp,
+    get_leave_balance, apply_leave,
+    list_my_leave_requests, list_pending_leave_requests, approve_leave_request,
+]
 
 # Tools available to the manager agent — approve escalated leave requests
 MANAGER_TOOLS = [get_leave_balance_from_hr_system, approve_leave_via_mcp]

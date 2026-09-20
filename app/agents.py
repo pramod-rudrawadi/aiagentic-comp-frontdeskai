@@ -1,5 +1,6 @@
 """Multi-agent support system with structured output, conversation memory, RAG, tool calling, and guardrails."""
 
+import logging
 import os
 import re
 import sqlite3
@@ -19,7 +20,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field, SecretStr
 
-from observability import trace_llm_call
+from observability import trace_llm_call, with_token_handler
 from rag import retrieve, format_context, format_sources
 from fewshot import retrieve_examples, format_fewshot_context
 from tools import DOMAIN_TOOLS, MANAGER_TOOLS
@@ -28,17 +29,21 @@ from skills import get_skill_tools
 
 # --- Dynamic LLM Configuration ---
 
+# Defaults come from the environment so a deployment can pick the provider
+# without touching code — the sandbox sets LLM_PROVIDER=litellm in a ConfigMap.
+# Unset env keeps the historical Ollama Cloud -> Groq pairing.
 _llm_config = {
-    "provider": "ollama",
-    "model": "gemma4:cloud",
+    "provider": os.getenv("LLM_PROVIDER", "ollama"),
+    "model": os.getenv("LLM_MODEL", "gemma4:cloud"),
     "temperature": 0.0,
-    "api_key": "",  # empty = use OLLAMA_API_KEY env var
+    "api_key": "",  # empty = use the provider's env var
 }
 _llm_fallback_config = {
-    "provider": "groq",
-    "model": "llama-3.3-70b-versatile",
+    "provider": os.getenv("LLM_FALLBACK_PROVIDER", "groq"),
+    # empty model disables the fallback (get_fallback_llm returns None)
+    "model": os.getenv("LLM_FALLBACK_MODEL", "llama-3.3-70b-versatile"),
     "temperature": 0.0,
-    "api_key": "",  # empty = use GROQ_API_KEY env var
+    "api_key": "",  # empty = use the provider's env var
 }
 _llm_cache: dict = {}  # keyed by config fingerprint
 
@@ -56,6 +61,25 @@ def _build_llm(cfg: dict):
             temperature=cfg["temperature"],
             api_key=SecretStr(api_key) if api_key else None,
             base_url="https://openrouter.ai/api/v1",
+        )
+    elif cfg["provider"] == "litellm":
+        # Any OpenAI-compatible gateway. The lab sandbox injects these per
+        # participant, so the app needs no key of its own and no vendor signup.
+        api_key = (
+            cfg["api_key"]
+            or os.getenv("LITELLM_API_KEY", "")
+            or os.getenv("OPENAI_API_KEY", "")
+        )
+        base_url = (
+            os.getenv("LITELLM_BASE_URL", "")
+            or os.getenv("OPENAI_BASE_URL", "")
+            or os.getenv("OPENAI_API_BASE", "")
+        )
+        return ChatOpenAI(
+            model=cfg["model"],
+            temperature=cfg["temperature"],
+            api_key=SecretStr(api_key) if api_key else None,
+            base_url=base_url or None,
         )
     elif cfg["provider"] == "ollama":
         api_key = cfg["api_key"] or os.getenv("OLLAMA_API_KEY", "")
@@ -127,13 +151,31 @@ def get_llm():
 
 
 def get_fallback_llm():
-    """Return a cached fallback LLM instance, or None if not configured."""
+    """Return a cached fallback LLM instance, or None if not configured or unusable.
+
+    A fallback that cannot even be CONSTRUCTED (provider 'groq' with no
+    GROQ_API_KEY raises in ChatGroq.__init__) must not take the primary down
+    with it. It used to: get_llm_chain built the fallback eagerly, so the
+    exception escaped before the primary was ever called, supervisor() caught it
+    and every request fell to category 'general' with confidence 1 -- which
+    routes to clarify. That made skill_admin, and therefore change_llm_model and
+    configure_fallback_llm, unreachable, so a bad fallback written from the admin
+    chat could only be undone with cluster access to the SQLite file.
+    Degrading to no-fallback keeps the primary, and the way back, reachable.
+    """
     cfg = _llm_fallback_config
     if not cfg.get("model"):
         return None
     cache_key = f"fb:{cfg['provider']}:{cfg['model']}:{cfg['temperature']}:{hash(cfg['api_key'])}"
     if cache_key not in _llm_cache:
-        _llm_cache[cache_key] = _build_llm(cfg)
+        try:
+            _llm_cache[cache_key] = _build_llm(cfg)
+        except Exception as e:
+            logging.getLogger("frontdeskai").warning(
+                "Fallback LLM (%s/%s) could not be built, continuing without a fallback: %s",
+                cfg.get("provider"), cfg.get("model"), e,
+            )
+            _llm_cache[cache_key] = None
     return _llm_cache[cache_key]
 
 
@@ -229,7 +271,14 @@ def get_llm_chain(structured_output_cls=None):
 # Load persisted config on import
 load_llm_config()
 
-MAX_TOOL_ITERATIONS = 3   # max tool-calling rounds per worker
+MAX_TOOL_ITERATIONS = 3   # default max tool-calling rounds per worker
+SKILL_ADMIN_TOOL_ITERATIONS = 8   # skill_admin researches before it builds: search_web,
+                                  # one or two fetch_webpage, then install_skill. Three
+                                  # rounds ran out mid-research and it never installed; six
+                                  # reached install_skill but left nothing to retry with when
+                                  # the generated code failed to import. Eight leaves room
+                                  # for one correction, which is the whole point of returning
+                                  # the loader's error as readable text.
 MAX_QA_RETRIES = 1        # max times QA can send worker back for self-correction
 
 
@@ -391,7 +440,9 @@ def supervisor(state: SupportRequest, config: RunnableConfig = None) -> dict:
         )
         with trace_llm_call("supervisor") as ctx:
             try:
-                result = get_llm_chain(Classification).with_config(callbacks=callbacks).invoke(prompt)
+                result = get_llm_chain(Classification).with_config(
+                    callbacks=with_token_handler(callbacks, ctx)
+                ).invoke(prompt)
             except Exception as parse_err:
                 # Model returned plain text instead of JSON — try regex extraction
                 raw = getattr(parse_err, "llm_output", "") or str(parse_err)
@@ -485,18 +536,29 @@ WORKER_CONFIGS = {
             "- Employee wants to CHECK leave balance → call get_leave_balance_from_hr_system "
             "(reads from the HR PostgreSQL database via MCP). "
             "Fall back to get_leave_balance only if the MCP tool returns an error.\n"
-            "- Employee wants to APPLY for leave → act as the approving HR officer:\n"
-            "  1. Call get_leave_balance_from_hr_system to verify the employee has sufficient balance.\n"
-            "  2. If balance is sufficient and request is ≤10 days, call approve_leave_via_mcp "
-            "with leave_type (casual/sick/earned/wfh), start_date, end_date (YYYY-MM-DD), "
-            "and reason. Infer exact dates from relative expressions using today's date.\n"
-            "  3. Confirm approval to the employee with the reference number and remaining balance.\n"
-            "  4. If balance is insufficient, inform the employee and suggest alternatives.\n"
-            "  5. If approve_leave_via_mcp reports the HR system is unreachable, call apply_leave "
-            "instead — it records the request locally for HR review.\n"
-            "Do NOT just explain policy — check balance and approve when the request is valid.\n"
-            "Never pass an employee_id — every tool, including the HR system tools, acts on the "
-            "caller's own record. If asked about someone else's leave, say you cannot access it.\n\n"
+            "- Employee wants to APPLY for leave → call apply_leave with leave_type "
+            "(casual/sick/earned/wfh), start_date, end_date (YYYY-MM-DD) and reason. Infer exact "
+            "dates from relative expressions using today's date. Short requests are approved "
+            "outright; longer ones are filed for the employee's own manager to decide. Report back "
+            "exactly what the tool returns, including the request number when there is one — never "
+            "tell the employee it is approved when the tool said it is awaiting a manager.\n"
+            "  If apply_leave reports the employee is not in the local system, they are an HR-system "
+            "employee: call approve_leave_via_mcp instead with the same arguments.\n"
+            "- A MANAGER asks what leave their team has pending, or what is waiting for them → call "
+            "list_pending_leave_requests (takes no arguments). Quote the request numbers back.\n"
+            "- A MANAGER wants to approve or reject a request → call approve_leave_request with "
+            "request_id (the number from the list) and status ('approved' or 'rejected'). The tool "
+            "decides whether the caller has the authority; if it refuses, relay the reason and do "
+            "not retry.\n"
+            "- Employee asks about the status of their own leave request(s) → call "
+            "list_my_leave_requests (takes no arguments).\n"
+            "Do NOT just explain policy — call the tool and act.\n"
+            "Never pass an employee_id — every tool, including the HR system tools, automatically "
+            "acts on the caller's own record. The employee named in the request below IS the "
+            "caller, so their own leave is always in scope: check it, never refuse it. "
+            "Refuse only if the request names a DIFFERENT person than the employee named below — "
+            "except for list_pending_leave_requests and approve_leave_request, which are about the "
+            "caller's OWN TEAM by design and therefore name other people legitimately.\n\n"
             "Escalate if: >10 days leave request, policy exceptions, or special circumstances."
         ),
         "can_escalate": True,
@@ -581,8 +643,11 @@ WORKER_CONFIGS = {
             "1. RESEARCH: Use search_web to find relevant APIs, libraries, or approaches\n"
             "2. LEARN: Use fetch_webpage to read API documentation or examples\n"
             "3. WRITE CODE: Generate a complete Python skill file with:\n"
+            "   - EVERY import the file uses, at the top. The file is executed as a bare\n"
+            "     module, so nothing is in scope unless you import it. It MUST include\n"
+            "     'from langchain_core.tools import tool', and each stdlib module you call —\n"
+            "     'import urllib.request' does NOT give you urllib.parse, import that too.\n"
             "   - SKILL_META = {'name': '...', 'description': '...', 'categories': ['...']}\n"
-            "   - from langchain_core.tools import tool\n"
             "   - One or more @tool decorated functions\n"
             "   - Use only stdlib imports (urllib, json, etc.) — no pip installs\n"
             "4. INSTALL: Use install_skill with the skill name, description, and complete code\n\n"
@@ -592,12 +657,18 @@ WORKER_CONFIGS = {
             "Always explain what you found and what the skill does after installing.\n\n"
             "LLM CONFIGURATION:\n"
             "- Use get_llm_config to show the current model, provider, temperature, and fallback.\n"
-            "- Use change_llm_model to switch models or providers. Supported providers: 'groq', 'openrouter', and 'ollama'.\n"
+            "- Use change_llm_model to switch models or providers. Supported providers: 'litellm', 'groq', 'openrouter', and 'ollama'.\n"
+            "  - PREFER 'litellm': it is the gateway this deployment is configured for and needs no API key. "
+            "Use it unless the admin explicitly names another provider AND supplies a key.\n"
+            "  - LiteLLM models: whatever the gateway serves, e.g. 'qwen36-35b-a3b-lab'. Call get_llm_config "
+            "first to see the model currently in use.\n"
+            "  - groq, openrouter and ollama each need an API key and will be REJECTED without one. "
+            "Do not guess a provider: switching to one that cannot be reached degrades every agent.\n"
             "  - Groq models: llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768, etc.\n"
             "  - OpenRouter models: use 'provider/model' format (e.g. 'google/gemini-2.0-flash-001', 'anthropic/claude-3.5-sonnet').\n"
             "  - Ollama Cloud models: e.g. 'llama3.3:70b', 'llama3.1:8b' (requires OLLAMA_API_KEY).\n"
             "- Use configure_fallback_llm to set a fallback LLM used automatically when the primary hits rate limits or errors.\n"
-            "  - Example: configure_fallback_llm('llama3.3:70b', provider='ollama') for Ollama Cloud fallback.\n"
+            "  - Example: configure_fallback_llm('qwen36-35b-a3b-lab', provider='litellm').\n"
             "  - To disable: configure_fallback_llm('none').\n"
             "- If the user provides an API key, pass it to the relevant tool. Never log or repeat API keys in your response.\n"
             "- Changes take effect immediately for all users.\n\n"
@@ -632,6 +703,7 @@ WORKER_CONFIGS = {
             "When asked to use branding from a website, use fetch_webpage to get colors, fonts, taglines, and incorporate them."
         ),
         "can_escalate": False,
+        "max_tool_iterations": SKILL_ADMIN_TOOL_ITERATIONS,
     },
 }
 
@@ -651,7 +723,8 @@ def _execute_tool_calls(ai_message: AIMessage, tools_by_name: dict) -> list[Tool
     return results
 
 
-def make_domain_worker(name: str, system_prompt: str, can_escalate: bool):
+def make_domain_worker(name: str, system_prompt: str, can_escalate: bool,
+                       max_tool_iterations: int = MAX_TOOL_ITERATIONS):
     """Factory that creates a domain worker with ReAct (Think-Act-Observe) loop and tools."""
 
     domain_tools = DOMAIN_TOOLS.get(name, [])
@@ -697,7 +770,8 @@ def make_domain_worker(name: str, system_prompt: str, can_escalate: bool):
          "{history}\n"
          "Today is {today}. Resolve relative dates such as 'tomorrow' or 'next Monday' "
          "against it and pass tools absolute YYYY-MM-DD dates.\n"
-         "Employee: {employee_name} (employee_id: {employee_id})\n"
+         "Employee making this request — this is the caller, and every tool acts on "
+         "their own record: {employee_name} (employee_id: {employee_id})\n"
          "[USER_REQUEST_START]\n{request}\n[USER_REQUEST_END]"),
     ])
 
@@ -758,7 +832,7 @@ def make_domain_worker(name: str, system_prompt: str, can_escalate: bool):
 
             # === ReAct Loop: Think → Act → Observe ===
             if active_tool_llm and active_tools:
-                for iteration in range(MAX_TOOL_ITERATIONS):
+                for iteration in range(max_tool_iterations):
                     react_iterations += 1
                     try:
                         with trace_llm_call(f"{name}_react_iter_{iteration}") as ctx:
@@ -807,7 +881,9 @@ def make_domain_worker(name: str, system_prompt: str, can_escalate: bool):
             # === Final structured response (with full tool context in messages) ===
             with trace_llm_call(f"{name}_worker_final") as ctx:
                 try:
-                    result = get_llm_chain(WorkerResponse).with_config(callbacks=callbacks).invoke(messages)
+                    result = get_llm_chain(WorkerResponse).with_config(
+                        callbacks=with_token_handler(callbacks, ctx)
+                    ).invoke(messages)
                 except Exception as parse_err:
                     # Model returned plain text instead of JSON — use it directly as the response
                     raw = getattr(parse_err, "llm_output", "") or ""

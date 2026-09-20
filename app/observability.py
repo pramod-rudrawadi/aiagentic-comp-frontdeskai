@@ -12,6 +12,10 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.view import (
+    ExplicitBucketHistogramAggregation,
+    View,
+)
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.trace import StatusCode
@@ -23,6 +27,32 @@ try:
 except ImportError:
     LangfuseCallbackHandler = None  # type: ignore[assignment,misc]
     _langfuse_available = False
+
+
+# ── Latency histogram buckets ───────────────────────────────────────
+
+# Both latency histograms record SECONDS. Without an explicit aggregation
+# OpenTelemetry applies its default boundaries -- 0, 5, 10, 25 ... 10000 --
+# which are chosen for MILLISECONDS, so every real observation lands in the
+# first bucket and histogram_quantile can only interpolate inside it: p50, p95
+# and p99 then return roughly the same fabricated number. Measured before this
+# fix on the lab gateway: supervisor, 12 calls totalling 18.82s, all 12 in
+# le=5.0.
+#
+# Boundaries below cover the measured envelope -- per-agent calls 0.9-3.3s,
+# end-to-end requests 13-57s -- with resolution across both.
+_LATENCY_BUCKETS = [0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0]
+
+_LATENCY_VIEWS = [
+    View(
+        instrument_name=name,
+        aggregation=ExplicitBucketHistogramAggregation(_LATENCY_BUCKETS),
+    )
+    for name in (
+        "frontdeskai_llm_call_duration_seconds",
+        "frontdeskai_request_duration_seconds",
+    )
+]
 
 
 # ── JSON Log Formatter ──────────────────────────────────────────────
@@ -92,17 +122,22 @@ def init_observability():
     service_name = os.environ.get("OTEL_SERVICE_NAME", "frontdeskai")
     resource = Resource.create({"service.name": service_name})
 
-    # Tracing with OTLP export to Tempo
+    # Tracing. Spans are still recorded locally when no collector is set; an
+    # empty OTEL_EXPORTER_OTLP_ENDPOINT skips the exporter rather than retrying
+    # against a host that is not there, which BatchSpanProcessor does silently.
     provider = TracerProvider(resource=resource)
     otlp_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo.monitoring.svc.cluster.local:4317")
-    otlp_exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
-    provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+    if otlp_endpoint:
+        otlp_exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
+        provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
     trace.set_tracer_provider(provider)
     _tracer = trace.get_tracer("frontdeskai")
 
     # Metrics with Prometheus exporter
     reader = PrometheusMetricReader()
-    meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+    meter_provider = MeterProvider(
+        resource=resource, metric_readers=[reader], views=_LATENCY_VIEWS
+    )
     metrics.set_meter_provider(meter_provider)
     _meter = metrics.get_meter("frontdeskai")
 
@@ -165,11 +200,81 @@ def get_tracer():
     return _tracer or trace.get_tracer("frontdeskai")
 
 
+class TokenCaptureHandler:
+    """Capture token usage from a chain whose output is a parsed object.
+
+    `with_structured_output()` returns the Pydantic model, not the AIMessage, so
+    `response_metadata` -- where trace_llm_call normally reads token counts -- is
+    gone by the time the call site sees the result. That silently attributed ZERO
+    tokens to the supervisor and to every worker's final answer: two of the five
+    workflow legs, invisible in cost reporting while their latency looked fine.
+
+    A callback sees the raw LLMResult before parsing, so it works for structured
+    and unstructured calls alike. Deliberately not a BaseCallbackHandler subclass:
+    LangChain duck-types handlers, and this keeps observability.py free of a
+    langchain import.
+    """
+
+    raise_error = False
+    run_inline = False
+    ignore_llm = False
+    ignore_chain = True
+    ignore_agent = True
+    ignore_retriever = True
+    ignore_chat_model = False
+    ignore_retry = True
+    ignore_custom_event = True
+
+    def __init__(self):
+        self.total_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        # Provider-level usage, which is where an OpenAI-compatible gateway puts it.
+        usage = (getattr(response, "llm_output", None) or {}).get("token_usage") or {}
+        total = usage.get("total_tokens") or 0
+        if not total:
+            # Per-generation usage_metadata, the newer LangChain shape.
+            for gen_list in getattr(response, "generations", []) or []:
+                for gen in gen_list:
+                    msg = getattr(gen, "message", None)
+                    um = getattr(msg, "usage_metadata", None) or {}
+                    total += um.get("total_tokens") or 0
+        self.total_tokens += total
+
+    def __getattr__(self, name):
+        # Every other on_* callback LangChain may probe for.
+        if name.startswith("on_"):
+            return lambda *a, **kw: None
+        raise AttributeError(name)
+
+
+def with_token_handler(callbacks, ctx):
+    """Return a `callbacks` value that also carries this call's token handler.
+
+    LangChain passes `config["callbacks"]` through as EITHER a plain list OR a
+    CallbackManager, depending on whether the call is nested inside another
+    runnable. Unpacking a CallbackManager with * raises
+    `TypeError: Value after * must be an iterable` -- and because the agents catch
+    the failure and fall through to a default classification, the app keeps
+    answering in ~100ms with category="general" and nothing looks broken.
+    """
+    handler = ctx["token_handler"]
+    if callbacks is None:
+        return [handler]
+    if hasattr(callbacks, "add_handler"):        # a CallbackManager
+        # copy() first: the manager belongs to the caller's run, and adding to it
+        # in place would accumulate a handler per call if it is ever reused.
+        mgr = callbacks.copy() if hasattr(callbacks, "copy") else callbacks
+        mgr.add_handler(handler, inherit=True)
+        return mgr
+    return [*callbacks, handler]                 # a plain list
+
+
 @contextmanager
 def trace_llm_call(agent_name: str):
     """Context manager: creates a span, measures duration, yields a dict for token capture."""
     tracer = get_tracer()
-    ctx = {"response": None}
+    ctx = {"response": None, "token_handler": TokenCaptureHandler()}
     with tracer.start_as_current_span(f"llm.{agent_name}") as span:
         span.set_attribute("agent.name", agent_name)
         start = time.monotonic()
@@ -184,13 +289,18 @@ def trace_llm_call(agent_name: str):
 
             # Extract token usage from response metadata
             resp = ctx.get("response")
-            if resp and hasattr(resp, "response_metadata"):
+            total_tokens = 0
+            if resp is not None and hasattr(resp, "response_metadata"):
                 meta = resp.response_metadata or {}
                 usage = meta.get("token_usage") or meta.get("usage") or {}
-                total_tokens = usage.get("total_tokens", 0)
-                if total_tokens and llm_tokens_total:
-                    llm_tokens_total.add(total_tokens, {"agent": agent_name})
-                    span.set_attribute("llm.tokens", total_tokens)
+                total_tokens = usage.get("total_tokens", 0) or 0
+            if not total_tokens:
+                # Structured-output chains hand back a parsed object with no
+                # metadata; the callback saw the raw LLMResult on the way past.
+                total_tokens = ctx["token_handler"].total_tokens
+            if total_tokens and llm_tokens_total:
+                llm_tokens_total.add(total_tokens, {"agent": agent_name})
+                span.set_attribute("llm.tokens", total_tokens)
 
             logger.info(
                 "LLM call completed",

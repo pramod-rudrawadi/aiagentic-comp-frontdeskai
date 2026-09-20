@@ -28,6 +28,7 @@ kubectl rollout restart deployment/frontdeskai
 | `amit.patel@unigps.in` | Amit Patel, Finance Lead | Can approve others' expense claims (Part 5) |
 | `vikram.singh@unigps.in` | Vikram Singh, Finance Analyst | Reports to Amit. Has a *rejected* training claim |
 | `neha.gupta@unigps.in` | Neha Gupta, Facilities Coordinator | Has a pending Goa leave request |
+| `sneha.reddy@unigps.in` | Sneha Reddy, Facilities Manager | Neha's manager — sees that request waiting for her in Part 11 |
 | `arjun.nayak@unigps.in` | Arjun Nayak, Engineering Manager | Rajesh's manager — the other approval path |
 | `admin@unigps.in` | Admin | **Required for Parts 7–8** — the only account with `skill_admin` access |
 
@@ -236,17 +237,18 @@ My VPN keeps dropping when I work from home
 → **This writes.** A new ticket is created with a priority and category the agent chose itself. Ask
 `list my tickets` to see it alongside the seeded ones.
 
-### Applying for leave — the agent as the approving officer
+### Applying for leave — the agent decides what it is allowed to decide
 
 ```
 I need 3 days of casual leave from 2026-09-14 to 2026-09-16 for a family function
 ```
 
-**What to observe in the audit trail:** the HR worker does not just acknowledge the request. It checks
-your balance first, confirms 3 days is within the 5-day no-approval limit, records the approved request,
-and reports the new remaining balance — a read, a policy decision, and a write from one sentence. When
-the HR MCP server is unavailable it degrades to `apply_leave`, which files the request in SQLite for a
-human to review.
+**What to observe in the audit trail:** the HR worker does not just acknowledge the request. It calls
+`apply_leave`, which checks your balance, applies the policy — short requests are approved outright,
+longer ones are filed for your manager — records the request with a number, and reports the new
+remaining balance. A read, a policy decision, and a write from one sentence. Ask for seven days instead
+and the same tool files it as pending rather than approving it; **Part 11** follows that request all the
+way through a human manager and back.
 
 ### Submitting an expense
 
@@ -499,6 +501,15 @@ This is the centrepiece. The system does not have a weather capability. Ask it t
 Install a skill to look up the current weather for a city
 ```
 
+> **If it answers "network connectivity issues", two things to check, in this order.**
+> The namespace must allow outbound 443/80 — a participant namespace (`agenticaiu<N>`) was an
+> allowlist with no internet until 2026-09-11, and kube-router *rejects*, so the tools got an
+> instant `[Errno 111] Connection refused`. Second: **start a new chat**. Prior turns are replayed
+> to the worker, so one failed attempt in the transcript teaches it to fail again — the same
+> request on a clean thread succeeds. This step also needs `skill_admin`'s larger tool budget
+> (`SKILL_ADMIN_TOOL_ITERATIONS`); with the default 3 the agent spends every round researching and
+> never reaches `install_skill`.
+
 **Watch the audit trail as it runs.** In one turn the agent:
 
 1. **Researches** — `search_web` then `fetch_webpage` to find and read a weather API's docs
@@ -665,6 +676,278 @@ Details: [observability.md](observability.md) and [langfuse-setup.md](langfuse-s
 
 ---
 
+## Part 11 — Human in the Loop: Where the Agent Stops and Waits
+
+Every part so far is the agent *doing* something. This one is about the places where it must not, and
+what it does instead. There are three distinct shapes of human-in-the-loop in this app, and they are
+easy to confuse:
+
+| Shape | Where | What the human supplies |
+|---|---|---|
+| **Ask before acting** | the clarify node (Part 1) | the missing information |
+| **Stop and hand over** | leave over 3 days, expense approval | the *decision* |
+| **Curate afterwards** | 👍/👎 (Part 3), Knowledge Base (Part 2) | the judgement about what was good |
+
+The middle one is the interesting one, because it is the only place where the agent holds a tool that
+would finish the job and is refused the use of it. There are two of those gates — leave, and expenses —
+and both are enforced in the tool rather than in the prompt.
+
+### A leave request and its manager, end to end
+
+Four turns, two people, one request. This is the shortest complete human-in-the-loop round trip in the
+app — the agent files, a human decides, the agent reports back.
+
+```mermaid
+sequenceDiagram
+    participant E as Rajesh (employee)
+    participant A as HR agent
+    participant DB as leave_requests
+    participant M as Arjun (his manager)
+    E->>A: I need 7 days casual leave
+    A->>DB: apply_leave — over 3 days, so pending
+    A-->>E: Request #8 filed, awaiting your manager
+    M->>A: anything pending from my team?
+    A->>DB: list_pending_leave_requests (manager_id = arjun)
+    A-->>M: Request #8 — Rajesh, 7 days, 12-18 Oct
+    M->>A: approve request #8
+    A->>DB: approve_leave_request — authority checked, balance deducted
+    A-->>M: Approved. Rajesh has 10 casual days left
+    E->>A: what is the status of my request?
+    A->>DB: list_my_leave_requests
+    A-->>E: Request #8 approved by Arjun Nayak
+```
+
+**Turn 1 — the employee asks.** As `rajesh.kumar@unigps.in`:
+
+```
+I need 7 days of casual leave from 2026-10-12 to 2026-10-18 for a family function
+```
+
+Measured reply: *"Your casual leave request #8 for 7 days … has been submitted and is awaiting manager
+approval. Please quote request #8 if you need to check the status later."*
+
+⚠️ **Your number will not be 8.** Request ids are sequential from the four seeded rows, so it depends on
+how many have been filed on that database — the run that produced these quotes got #8 and the very next
+run on the same database got #9. Turns 3 and 4 below say `#8`; **use the number you were actually
+given.** The number matters more than it looks: before `apply_leave` returned one, the model **invented**
+a plausible id (`#7892`, against a row that was `#7`) because it had nothing real to quote.
+
+**What to observe:** the request number, and the fact that the balance did **not** move. Ask
+`what is my leave balance?` — still 17 casual days, with the seven listed separately as pending. The
+agent is holding the decision open on behalf of a human, and is careful not to spend the balance in the
+meantime. Anything up to three days would have been approved on the spot; over that, the tool files it.
+
+**Turn 2 — the manager asks what is waiting.** Log out, log in as `arjun.nayak@unigps.in` — Rajesh's
+manager in the `employees` table:
+
+```
+Are there any pending leave requests from my team?
+```
+
+Measured reply: *"There is one pending leave request from your team: Request #8 from Rajesh Kumar for 7
+days of casual leave from 2026-10-12 to 2026-10-18."*
+
+**What to observe:** the manager never said whose requests, or named a team. `list_pending_leave_requests`
+takes **no arguments** — it resolves the team from `employees.manager_id` using the session identity, so
+it is structurally incapable of showing one manager another manager's queue. Log in as
+`priya.sharma@unigps.in` and ask the same thing: *"no pending leave requests from your team"* — her one
+report has nothing pending. Then try `sneha.reddy@unigps.in`, who manages Neha Gupta: she sees the
+seeded Goa request, #3, with no setup at all.
+
+**Turn 3 — the manager decides.** Still as Arjun:
+
+```
+Approve leave request #8
+```
+
+Measured reply: *"Leave request #8 for Rajesh Kumar has been successfully approved … their remaining
+casual leave balance is 10 days."* The days are deducted **now**, at the decision, not when the request
+was filed — and the balance is re-checked at that moment, so a request that was affordable in October
+is refused in December if the days have been spent since.
+
+Try it from the wrong account and watch it hold. As `priya.sharma@unigps.in`:
+
+```
+Approve leave request #3
+```
+
+Refused — Neha reports to Sneha, not to Priya. The three rules are the same shape as the expense rules
+and are read from the `employees` table by the tool, never from the conversation:
+
+| Who tries | Result |
+|---|---|
+| the requester | refused — nobody decides their own leave |
+| a manager who is not *their* manager | refused |
+| the requester's own manager | decided, and recorded in `approved_by` |
+
+**Turn 4 — the employee reads it back.** Log back in as `rajesh.kumar@unigps.in`:
+
+```
+What is the status of my leave request?
+```
+
+Measured reply: *"Request #8 for 7 days of casual leave … has been approved by Arjun Nayak."* The
+employee learns who decided, not just what was decided. Verify the row independently:
+
+```bash
+kubectl exec deployment/frontdeskai -- python -c \
+  "import sqlite3,os; c=sqlite3.connect(os.environ.get('SQLITE_DIR','/shared/.sqlite')+'/frontdesk_tools.db'); \
+   print(c.execute('select id,employee_id,days,status,approved_by from leave_requests').fetchall())"
+```
+
+**What the whole sequence demonstrates:** neither person used a form, a queue screen, or an approval
+workflow product. Both typed a sentence into the same box, and the difference between them was not what
+they typed — it was who the database says they are. Nothing in those four turns named an employee id: the
+employee never said who they were, and the manager never said whose requests to show. Every one of the
+three tools takes its subject from the session and the reporting line, which is why the same four
+sentences behave differently depending on who is logged in.
+
+⚠️ **There is still no notification.** Rajesh is not told when Arjun decides; he has to ask. Closing that
+is the obvious next exercise, and the app already has the SMTP tool from Part 7 to do it with.
+
+### The same boundary in finance: an expense claim
+
+Leave is decided by the reporting line. Money is decided by the reporting line **or** by finance
+seniority, which makes the authority rules worth walking separately.
+
+```mermaid
+flowchart TD
+    A[Rajesh: please claim this expense] --> B[Finance worker]
+    B --> C[submit_expense_claim]
+    C --> D[(status = submitted<br/>reviewed_by = NULL)]
+    D --> E{Who is asking to decide it?}
+    E -->|the claimant| F[Refused: nobody decides their own]
+    E -->|no authority| G[Refused: not manager, not finance approver]
+    E -->|manager or senior finance| H[approve_expense_claim]
+    H --> I[(status = approved<br/>reviewed_by = arjun.nayak)]
+    F --> J[Claim stays pending — a human is still required]
+    G --> J
+```
+
+### Step 1 — the agent works up to the boundary, then stops
+
+As `rajesh.kumar@unigps.in`:
+
+```
+I spent INR 7,800 on a client visit to Hyderabad last week - flight tickets. Please claim it.
+```
+
+**What to observe:** a claim id comes back with status `submitted (pending finance review)`. Ids are
+sequential from the five seeded claims, so yours depends on how many you have raised already — the steps
+below say `EXP-2026-0008`; **substitute the id you were actually given.**
+
+Now note what is *not* in the audit trail: the finance worker holds `approve_expense_claim` in the very
+same tool list it just used to call `submit_expense_claim`. It had the means to finish the job in one
+turn and did not. Nothing in the prompt asked it to hold back — the
+boundary is in the tool, which resolves the approver from the session and checks authority in the
+`employees` table before it writes.
+
+### Step 2 — the claimant cannot approve their own claim
+
+Stay logged in as Rajesh and ask for the claim he just raised:
+
+```
+Approve expense claim EXP-2026-0008
+```
+
+**What to observe:** refused, and read the audit trail rather than the sentence. The trail shows the
+tool *was* called —
+`Finance ReAct: 2 iteration(s), tools: approve_expense_claim({'claim_id': 'EXP-2026-0008', 'status': 'approved'})`
+— and returned `You cannot approve or reject your own expense claim.` The model then relays that
+refusal. The guardrail is not the model declining; it is the model trying and the tool saying no.
+
+⚠️ **Read the trail, not the prose.** The reply also offers to route you through "the HR portal" and
+promises reimbursement "within 7–10 working days". There is no HR portal in this system. The refusal is
+real and the embroidery around it is not — which is exactly why every scenario in this document tells
+you to open the audit trail and, where it matters, to check the database.
+
+### Step 3 — neither can an unrelated human
+
+Log out, log in as `priya.sharma@unigps.in` (HR Manager) and send the same message. Then try
+`vikram.singh@unigps.in` (Finance Analyst). Both are refused with *"Only the claimant's manager or a
+senior finance approver can approve or reject it."*
+
+| Who tries | Result | Why |
+|---|---|---|
+| `rajesh.kumar` (the claimant) | refused | nobody decides their own claim |
+| `vikram.singh` (Finance **Analyst**) | refused | finance department, but not a senior designation |
+| `priya.sharma` (HR Manager) | refused | a manager, but not *Rajesh's* manager |
+| `arjun.nayak` (Rajesh's manager) | **approved** | `employees.manager_id` says so |
+| `amit.patel` (Finance **Lead**) | **approved** | senior finance designation |
+
+Seniority is matched on the designation text — lead, manager, director, head, VP, chief — so Vikram's
+department alone buys him nothing. Being *a* manager is not enough either; Priya has to be the
+claimant's manager.
+
+### Step 4 — the human with authority decides, in the same chat box
+
+Log in as `arjun.nayak@unigps.in` — Rajesh's manager — and send:
+
+```
+Approve expense claim EXP-2026-0008
+```
+
+**What to observe:** `Expense claim EXP-2026-0008 has been approved by arjun.nayak.` The human did not
+open an admin screen, a workflow tool, or a queue. They typed a sentence into the same box the employee
+used, and the agent executed a decision it was not allowed to make on its own. That is the whole
+pattern: the agent carries the work up to the decision, a human makes the decision, the agent carries
+it out and records who made it.
+
+### Step 5 — and the decision is final
+
+As `amit.patel@unigps.in`, who genuinely does have authority, try to overturn it:
+
+```
+Reject expense claim EXP-2026-0008
+```
+
+**What to observe:** `Claim EXP-2026-0008 is already approved — cannot change status.` Only `submitted`
+and `under_review` claims are decidable, so a second approver cannot quietly re-decide a settled claim.
+Verify the whole trail independently — the row carries who decided and when:
+
+```bash
+kubectl exec deployment/frontdeskai -- python -c \
+  "import sqlite3,os; c=sqlite3.connect(os.environ.get('SQLITE_DIR','/shared/.sqlite')+'/frontdesk_tools.db'); \
+   print(c.execute('select claim_id,employee_id,status,reviewed_by,reviewed_at from expense_claims').fetchall())"
+```
+
+### The gate that looks like a human gate and is not
+
+Part 5's escalation is the trap. A 15-day leave request sets `needs_escalation`, the graph diverts
+through the **manager** node, and the audit trail says `Hr worker: escalating`. It reads like a handover
+to a person. It is not — the manager node is another LLM with its own prompt and its own tools, and in
+Part 9 it reads a balance and writes an approval to the HR database without a human seeing it.
+
+Calling a node "manager" does not put a human in the loop. The test is not what the node is named or
+what the trail says; it is whether the system can complete the action without a person. By that test
+this app has exactly two human gates — expense approval, and local leave over three days — and both of
+them are enforced in a tool, not in a prompt.
+
+### What a full implementation would add
+
+Worth discussing at this point, because the app is one step away from it: the graph is already compiled
+with a `SqliteSaver` checkpointer keyed on your email address (`app/app.py`), so every conversation's
+state is already durable and resumable. What it does not have is an interrupt point — no node is
+declared with `interrupt_before`, so a run always goes from START to END in one pass and a "pending"
+decision lives in a database row rather than in a paused graph.
+
+The three pieces that would close it:
+
+1. **Pause** — compile with `interrupt_before=["manager"]` so an escalated request stops *inside* the
+   graph instead of answering with a holding message.
+2. **Surface** — a queue the approver can actually see. Leave has one
+   (`list_pending_leave_requests`, resolved from the reporting line); **expenses do not**, so an
+   approver still has to be told the claim id by the claimant. That asymmetry is worth noticing: the
+   same system draws the same boundary twice and only made it usable once.
+3. **Resume** — the approver's decision resumes the same thread from the checkpoint, so the employee's
+   original request is answered rather than a new conversation being started about it.
+
+Note which of those is *not* on the list: moving the authority check into the prompt. The reason Steps 2
+and 3 hold is that authority is read from the `employees` table by the tool itself, and no phrasing in
+the conversation reaches it.
+
+---
+
 ## Suggested 60-Minute Path
 
 | Time | Part | The point |
@@ -677,6 +960,7 @@ Details: [observability.md](observability.md) and [langfuse-setup.md](langfuse-s
 | 5 min | 6 | Analytics and account — business questions without a dashboard |
 | 15 min | 7–8 | Self-configuration and the self-teaching loop — **the reason this app exists** |
 | 5 min | 9–10 | MCP reads *and writes*, then Langfuse to read the actual prompts |
+| 5 min | 11 | Human in the loop — the two decisions the agent is not allowed to make |
 
 If you only have ten minutes, do Part 8. If you have fifteen, add Part 3 — together they are the two
 ways this system changes itself without a redeploy.

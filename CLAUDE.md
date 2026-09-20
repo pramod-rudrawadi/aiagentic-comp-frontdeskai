@@ -4,7 +4,7 @@
 
 FrontDesk AI is a self-evolving agentic AI employee support desk built with FastAPI, LangGraph, and Ollama Cloud/Groq/OpenRouter LLMs. It routes employee chat requests through a supervisor agent to domain-specific workers (HR, Tech, Finance, Facilities, Analytics, Account, Skill Admin), with RAG-powered policy retrieval, tool-calling, QA checks, and escalation handling.
 
-**Primary LLM:** Ollama Cloud (`api.ollama.com`) — `gemma4:cloud` via `ChatOllama` (`langchain-ollama`). Groq (`llama-3.3-70b-versatile`) is the automatic fallback.
+**Primary LLM:** provider-selectable via `LLM_PROVIDER`. Default is Ollama Cloud (`api.ollama.com`) — `gemma4:cloud` via `ChatOllama` — with Groq (`llama-3.3-70b-versatile`) as the automatic fallback. On the Spark cluster it is `litellm`: an OpenAI-compatible gateway whose base URL and per-participant key are injected by the platform, so the app needs no vendor account. `_build_llm` in `agents.py` knows four providers — `ollama`, `groq`, `openrouter`, `litellm`.
 
 **What makes it agentic:** The system teaches itself new capabilities at runtime — admins describe a skill in plain English, and the system researches APIs, writes Python code, validates it, installs it to disk, configures it (API keys encrypted in DB), and executes it via domain workers. Everything persists across restarts with zero rebuild. Skills, config, LLM provider, and SMTP settings are all managed through conversation.
 
@@ -93,7 +93,7 @@ app/
 | `app/app.py` | FastAPI routes: login, chat, KB management, analytics API, admin gates, `/chat/feedback` (👍/👎 → few-shot memory). The chat reply returns the audit trail to every user (it was already rendered on `/chat` reload); the raw `tool_calls` list stays admin-only |
 | `app/agents.py` | LangGraph StateGraph: supervisor, 8 domain workers, QA, manager, fallback. Dynamic LLM factory (`get_llm()`) supports Ollama Cloud, Groq, and OpenRouter providers |
 | `app/auth.py` | Password hashing (PBKDF2-SHA256, 600k iter), `users` table, `current_user_email` ContextVar |
-| `app/tools.py` | LangChain `@tool` functions for each domain + schema/seed data. HR tools include `get_leave_balance_from_hr_system` (MCP client) as the primary leave tool. Domain tools take **no** identity argument — `_get_current_employee_id()` reads the `current_user_email` ContextVar. `approve_expense_claim(claim_id, status)` additionally checks *authority* via `_expense_approval_denial()`: the claimant's manager, or a finance department member whose designation contains lead/manager/director/head/vp/chief, and never the claimant themselves |
+| `app/tools.py` | LangChain `@tool` functions for each domain + schema/seed data. HR tools include `get_leave_balance_from_hr_system` (MCP client) as the primary leave *read*; applying goes to local `apply_leave`, which auto-approves ≤3 days and otherwise files a `pending` row whose number it returns. The manager side is `list_pending_leave_requests()` (no args — the team comes from `employees.manager_id`) and `approve_leave_request(request_id, status)`, which admits only the requester's own manager, never the requester, re-checks the balance at decision time and deducts it then; the employee reads it back with `list_my_leave_requests()`. Domain tools take **no** identity argument — `_get_current_employee_id()` reads the `current_user_email` ContextVar. `approve_expense_claim(claim_id, status)` additionally checks *authority* via `_expense_approval_denial()`: the claimant's manager, or a finance department member whose designation contains lead/manager/director/head/vp/chief, and never the claimant themselves |
 | `app/skills.py` | Dynamic skill registry: load/install/list/configure skills, web research tools, `skill_config()` helper, runtime tool injection |
 | `app/rag.py` | ChromaDB indexing of `app/data/policies/*.md` into the `unigps_policies` collection, retrieval with category filtering (ONNX embeddings, no torch). Persists to `$CHROMA_DIR` (default `/shared/chromadb`) |
 | `app/fewshot.py` | Few-shot memory — successful Q&A pairs in the `fewshot_examples` Chroma collection, retrieved per-category by semantic similarity and injected into domain worker prompts. Written by a 👍 via `/chat/feedback` when `_qualifies_for_fewshot` passes (confidence ≥ 7, not escalated, not fallback, category not general/blank); 👎 removes it from SQLite and Chroma. Memory is per-category and shared across users |
@@ -178,9 +178,14 @@ kubectl logs deployment/frontdeskai
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `OLLAMA_API_KEY` | Yes (primary LLM) | — sign up at https://ollama.com |
-| `GROQ_API_KEY` | Recommended (fallback LLM) | — sign up at https://console.groq.com |
+| `LLM_PROVIDER` | No | `ollama`. Set to `litellm` to use an OpenAI-compatible gateway. Read by **both** `agents.py` and `tools.py` — `tools.py` seeds `system_config` in SQLite and `load_llm_config()` reads it back, and that seed wins over the module default, so the two must always read the same env |
+| `LLM_MODEL` | No | provider-specific default |
+| `LLM_FALLBACK_PROVIDER` / `LLM_FALLBACK_MODEL` | No | `groq` / `llama-3.3-70b-versatile`. An **empty** `LLM_FALLBACK_MODEL` disables the fallback (`get_fallback_llm()` returns `None`) — which is what you want where no second vendor is reachable |
+| `LITELLM_BASE_URL` / `LITELLM_API_KEY` | With `LLM_PROVIDER=litellm` | falls back to `OPENAI_BASE_URL` / `OPENAI_API_BASE` and `OPENAI_API_KEY` |
+| `OLLAMA_API_KEY` | Yes when `LLM_PROVIDER=ollama` | — sign up at https://ollama.com |
+| `GROQ_API_KEY` | Recommended as fallback | — sign up at https://console.groq.com |
 | `OPENROUTER_API_KEY` | No (alternative provider) | — |
+| `HOME` | **Do not set** | `/opt/appcache`, set by the image. ChromaDB resolves its embedding-model cache from `Path.home()` and the model is baked in at that path. Overriding `HOME` sends it looking for a model it must then download — see the Spark section |
 | `SECRET_KEY` | Production | Auto-generated in dev (also used to derive SMTP password encryption key — if rotated, admin must re-run `configure_smtp`) |
 | `AUTH_PASSWORD` | No | `brainupgrade` |
 | `ADMIN_EMAILS` | No | `admin@unigps.in` |
@@ -188,7 +193,7 @@ kubectl logs deployment/frontdeskai
 | `CHROMA_DIR` | No | `/shared/chromadb` |
 | `MCP_LEAVE_URL` | No | `http://mcp-leave.postgres.svc.cluster.local:8001/mcp` (set in `deployment.yaml`) |
 | `OTEL_SERVICE_NAME` | No | `frontdeskai` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | `http://tempo.monitoring.svc.cluster.local:4317` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | `http://tempo.monitoring.svc.cluster.local:4317`. **Set it to the empty string to skip the OTLP exporter entirely** — `BatchSpanProcessor` swallows export failures, so a wrong endpoint drops every span while the app looks healthy. Tempo runs in `monitoring` on the Spark cluster since 2026-09-11 |
 | `LOG_LEVEL` | No | `INFO` |
 | `SEED_DEMO_DATA` | No | `false` in code — but `true` in both `deployment.yaml` and `.env.example`, so every documented path starts with 10 employees, leave balances, tickets, expenses, rooms and payslips. The seed is idempotent (`INSERT OR IGNORE`), so it fills gaps on restart without overwriting runtime changes |
 | `LANGFUSE_SECRET_KEY` | No (LLM tracing) | — all three Langfuse vars must be set, else tracing is disabled |
@@ -255,6 +260,9 @@ get_leave_balance_from_hr_system  ──────→  FastMCP · streamable-h
 | `scripts/quickstart.sh` | **Participant entry point** — validates/populates `.env`, creates the cluster if missing, deploys app + MCP, waits for `/health`, verifies seeded row counts, prints demo logins. Idempotent; `SKIP_MCP=true` to skip MCP |
 | `scripts/create-kind-cluster.sh` | One-time localhost/cloud-labs setup — creates kind cluster `frontdeskai` with NodePort mappings + `/shared/.sqlite`; equivalent of `.devcontainer/setup.sh` for non-Codespace hosts |
 | `scripts/deploy.sh` | One-command deploy — build + load/push + apply manifests + rollout restart, auto-detects kind vs production; preserves existing `SECRET_KEY` to avoid breaking encrypted DB values. Requires **at least one** of `OLLAMA_API_KEY` / `GROQ_API_KEY` (neither is individually mandatory) |
+| `scripts/deploy-spark.sh` | **Spark cluster / participant namespace deploy.** Takes no arguments — `APP_NAMESPACE` and `APP_HOST` are already exported in a sandbox shell. Creates the ConfigMap, Service, Deployment, PVC, Ingress and `frontdeskai-secret`, preserving `SECRET_KEY` across redeploys (it is the Fernet key for encrypted skill config). `IMAGE=` overrides the image |
+| `scripts/manifests/spark/` | The Spark manifest set — **separate from the kind set on purpose**, because the participant namespace forbids NodePorts and caps memory |
+| `scripts/eval/hr_worker_eval.py` | Prompt-regression eval: does the HR worker call its tools, and does it still refuse for other people? Runs the real worker against the real model. See `scripts/eval/README.md` |
 | `scripts/deploy-mcp.sh` | Deploy MCP Leave Service — PostgreSQL + MCP server into `postgres` namespace + smoke test |
 | `scripts/update-secret.sh` | Update K8s secret from `.env` without rebuilding image (preserves SECRET_KEY, includes OLLAMA_API_KEY + GROQ_API_KEY + Langfuse) |
 | `scripts/install-observability.sh` | Install Prometheus, Grafana, Loki, Promtail, Tempo via Helm into `monitoring` namespace |
@@ -269,6 +277,86 @@ get_leave_balance_from_hr_system  ──────→  FastMCP · streamable-h
 | `scripts/observability/loki.yaml` | Loki Helm values — SingleBinary, filesystem storage |
 | `scripts/observability/promtail.yaml` | Promtail Helm values — JSON log parsing, trace_id label extraction |
 | `scripts/observability/kube-prometheus-stack.yaml` | Grafana + Prometheus Helm values — datasources with full 3-way correlation |
+
+## Deployment — Spark cluster, one participant namespace each (2026-09-11)
+
+**This is the workshop path.** The kind path below is unchanged and still works; the two use
+different manifest sets because a participant namespace is not a laptop.
+
+```bash
+bash scripts/deploy-spark.sh        # in a JupyterLab terminal — no arguments needed
+```
+
+`APP_NAMESPACE` (`agenticaiu<N>`) and `APP_HOST` (`agenticai<COHORT>u<N>-app.brainupgrade.in`) are
+already exported in a sandbox shell, so the script needs nothing from the participant. It creates
+the ConfigMap, Service, Deployment, PVC and **Ingress** — the Ingress must live in the participant
+namespace, because an Ingress backend cannot cross namespaces.
+
+**The image is built by GitHub Actions**, not locally: Actions tab → *Build and push Docker image*
+→ Run workflow. It publishes `brainupgrade/frontdeskai` tagged with the full commit SHA, the short
+SHA and `latest`, for **linux/amd64 and linux/arm64**.
+
+### Five constraints of that environment, all measured — do not design around guesses
+
+| | |
+|---|---|
+| **The nodes are arm64** | The cluster is a DGX Spark. An amd64-only image fails to pull with `no match for platform in manifest` and the pod sits in `ImagePullBackOff`. The workflow builds both arches; the arm64 leg is QEMU-emulated and takes ~12 min against ~2 for amd64 alone |
+| **No internet egress** | `participant-egress` allows DNS, the `llm-serving` namespace, ingress-nginx and Langfuse:3000 — **nothing else**. This is *not* the `agenticai` sandbox namespace, which has `allow-egress-internet`. Anything fetched at startup must be baked into the image |
+| **1Gi of memory limits for the whole namespace** | One pod at a 1Gi limit consumes all of it, so the Deployment uses `strategy: Recreate`. A RollingUpdate surges a second pod, which is quota-denied, and the rollout hangs with no useful message. A `kubectl run` debug pod is refused for the same reason — use `kubectl exec` into the app container, which ships Python |
+| **Zero NodePorts** | `services.nodeports: 0`. ClusterIP + Ingress only |
+| **The host is behind Cloudflare** | Two separate traps. It answers the default Python user agent with `403` / `error code: 1010`, so anything scripted against the public hostname needs a `User-Agent` header. And it gives up at **~100s with a 524** — a three-turn agent request exceeds that whenever the gateway is slow, and the 524 reads as a broken app while the pod is still working. Script against the pod (`kubectl exec … python3`), not the hostname |
+
+### Traces go to Tempo in the `monitoring` namespace
+
+`deploy-spark.sh` points `OTEL_EXPORTER_OTLP_ENDPOINT` at
+`tempo.monitoring.svc.cluster.local:4317` and sets
+**`OTEL_SERVICE_NAME=frontdeskai-<namespace>`** — one Tempo serves the whole cohort, so the
+service name has to carry the namespace or nobody can find their own traces. Read them in
+Grafana: *Explore → Tempo → service.name*.
+
+What a request produces, measured on u31: a `chat.send` root span with `user.email`,
+`chat.history_turns` and `chat.category`, and a child span per agent step —
+`llm.supervisor`, `llm.hr_react_iter_0..2`, `llm.hr_worker_final` — each carrying
+`llm.tokens`. That is the view Langfuse does not give: Langfuse shows generations, this shows
+where the wall-clock went across the whole graph.
+
+⚠️ **A missing NetworkPolicy is invisible from inside the app.** The participant namespace is
+default-deny egress; without a rule for `monitoring:4317` the exporter fails and
+`BatchSpanProcessor` swallows it, so the app is healthy, the config looks right, and no span
+ever lands. The rules live in `mtvlab/agenticai/tempo/`.
+
+### The LLM comes from the platform, not from a vendor key
+
+`LLM_PROVIDER=litellm` points `_build_llm` at an OpenAI-compatible gateway
+(`http://litellm-gateway.llm-serving.svc.cluster.local:8080/v1`). The credential is **not copied**:
+`deployment.yaml` mounts the platform's existing `agenticaiu<N>-llm` Secret with `envFrom`, so each
+participant uses their own key with its own daily cap, and nothing needs a Groq or Ollama signup.
+The fallback is disabled (empty `LLM_FALLBACK_MODEL`) because no second vendor is reachable.
+
+⚠️ **The embedding model is baked into the image.** `Containerfile` pre-fetches ChromaDB's
+`all-MiniLM-L6-v2` into `/opt/appcache` and pins `ENV HOME` there. Without it the app crash-loops on
+startup with `httpx.ConnectError` while every manifest is valid and every probe configured — the
+download is refused by the network policy. **Never set `HOME` in the ConfigMap.**
+
+### ⚠️ Conversation history anchors the workers — the HR tool-calling bug (2026-09-11)
+
+The HR worker answered *"I cannot access records for other employees, such as Rajesh Kumar"* while
+Rajesh Kumar was the logged-in caller, and called no tool. Both balance tools take **no arguments**,
+so nothing was missing from the request; it was refusing outright.
+
+It was not the model and not the wiring — both were checked first, and the same build answered
+correctly on a clean thread. `format_history()` renders prior turns as `Support: …`, so **one
+refusal in the transcript becomes an example the model follows**, and every later turn repeats it.
+
+Measured with `scripts/eval/hr_worker_eval.py` (real worker, real model, four requests × clean and
+poisoned history): **10/16 before, 16/16 after**. All four failures were under poisoned history. The
+fix is wording — the HR prompt now says the employee named in the request *is* the caller and that
+refusing applies only to a **different** person, and the identity line says so at the point of use
+rather than leaving `Employee: <name>` to read as a third party. The "someone else's balance" case
+still refuses in both arms.
+
+**If you change a worker prompt, run that eval.** A prompt regression is invisible to `pytest`, and
+this one shipped looking like a broken integration.
 
 ## Deployment — kind cluster (Codespace / cloud-labs / local)
 
