@@ -85,6 +85,19 @@ apply_secret() {
     echo "    GROQ_API_KEY not set — no fallback if Ollama Cloud rate-limits"
   fi
   if [ -n "${LANGFUSE_SECRET_KEY:-}" ] && [ -n "${LANGFUSE_PUBLIC_KEY:-}" ] && [ -n "${LANGFUSE_HOST:-}" ]; then
+    # Validate credentials against Langfuse API before deploying
+    echo "    Validating Langfuse credentials..."
+    AUTH_RESPONSE=$(curl -s -w "\n%{http_code}" -u "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" \
+      "${LANGFUSE_HOST}/api/public/traces?limit=1" 2>/dev/null || echo -e "\n000")
+    HTTP_CODE=$(echo "${AUTH_RESPONSE}" | tail -n1)
+    if [ "${HTTP_CODE}" = "200" ]; then
+      echo "    Langfuse auth check: OK"
+    else
+      echo "    WARNING: Langfuse auth check failed (HTTP ${HTTP_CODE})"
+      echo "    Keys may be invalid or host region may not match key region."
+      echo "    Continuing anyway — check 'kubectl logs deployment/frontdeskai | grep langfuse' after deploy."
+    fi
+
     SECRET_ARGS+=(
       --from-literal=LANGFUSE_SECRET_KEY="${LANGFUSE_SECRET_KEY}"
       --from-literal=LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY}"
